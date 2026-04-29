@@ -81,12 +81,12 @@ def _decode_rgb_value(value) -> np.ndarray:
             raise ValueError(f"Expected RGB array with shape HxWx3, got {value.shape}")
         if value.dtype != np.uint8:
             value = np.clip(value, 0, 255).astype(np.uint8)
-        return value
+        return np.ascontiguousarray(value)
     if isinstance(value, (bytes, bytearray)):
         decoded = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
         if decoded is None:
             raise RuntimeError("Failed to decode RGB image bytes")
-        return decoded[..., ::-1]
+        return np.ascontiguousarray(decoded[..., ::-1])
     raise TypeError(f"Unsupported RGB value type: {type(value)}")
 
 
@@ -267,7 +267,7 @@ def load_future_rgb_from_dir(path: str | None, max_frames: int | None) -> np.nda
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError(f"Failed to read {image_path}")
-        frames.append(image[..., ::-1])
+        frames.append(np.ascontiguousarray(image[..., ::-1]))
     return np.stack(frames, axis=0)
 
 
