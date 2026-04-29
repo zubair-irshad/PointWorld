@@ -105,8 +105,6 @@ def render_gaussians_gsplat(
     quats = quats.contiguous()
     viewmats = extrinsic.to(device=points.device, dtype=points.dtype).reshape(1, 4, 4).contiguous()
     Ks = intrinsic.to(device=points.device, dtype=points.dtype).reshape(1, 3, 3).contiguous()
-    backgrounds = bg_color.reshape(1, 3).contiguous()
-
     render_colors, render_alphas, meta = rasterization(
         means=means,
         quats=quats,
@@ -123,16 +121,16 @@ def render_gaussians_gsplat(
         eps2d=float(eps2d),
         sh_degree=None,
         packed=bool(packed),
-        backgrounds=backgrounds,
+        backgrounds=None,
         render_mode="RGB+ED",
         rasterize_mode=rasterize_mode,
         absgrad=bool(absgrad),
     )
 
     rendered = render_colors[0]
-    image = rendered[..., :3].clamp(0.0, 1.0)
-    depth_img = rendered[..., 3:4]
     alpha = render_alphas[0].clamp(0.0, 1.0)
+    image = (rendered[..., :3] + bg_color.view(1, 1, 3) * (1.0 - alpha)).clamp(0.0, 1.0)
+    depth_img = rendered[..., 3:4]
     pixels, depth = project_points(points, intrinsic, extrinsic)
     valid = (
         torch.isfinite(pixels).all(dim=-1)
