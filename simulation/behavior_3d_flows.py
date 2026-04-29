@@ -363,6 +363,7 @@ class BehaviorFlowExtractor:
 
                 self._record_robot_state(candidate.robot_series, clip_frame_idx, candidate.world_to_robot)
                 self.camera_extractor.record_mesh_and_camera_poses(candidate.clip_seed, clip_frame_idx)
+                self.camera_extractor.record_rgb_frame(candidate.clip_seed, obs, clip_frame_idx)
                 self.motion_tracker.update_motion_metrics(candidate, frame_idx, transitions_flags)
 
                 candidate.frames_written += 1
@@ -499,7 +500,13 @@ class BehaviorFlowExtractor:
 
     def _process_input_file(self, input_file, output_file):
         """Process a single H5 file with per-clip temp outputs, then aggregate to final."""
-        self.clip_writer = ClipWriter(output_file, self._get_joint_names, input_file)
+        self.clip_writer = ClipWriter(
+            output_file,
+            self._get_joint_names,
+            input_file,
+            rgb_sequence_format=self.args.rgb_sequence_format,
+            rgb_jpeg_quality=self.args.rgb_jpeg_quality,
+        )
         if self.clip_writer.cleanup_if_output_complete():
             print(f"Final output already complete at {output_file}; exiting early.")
             return
@@ -566,6 +573,23 @@ def build_arg_parser():
     # Image parameters
     parser.add_argument("--image_height", type=int, default=180, help="Image height for external cameras")
     parser.add_argument("--image_width", type=int, default=320, help="Image width for external cameras")
+    parser.add_argument(
+        "--store_rgb_sequence",
+        action="store_true",
+        help="Store per-frame camera RGB sequences in generated H5 clips for photometric supervision.",
+    )
+    parser.add_argument(
+        "--rgb_sequence_format",
+        choices=["jpeg", "png"],
+        default="jpeg",
+        help="Encoding format for optional RGB sequences.",
+    )
+    parser.add_argument(
+        "--rgb_jpeg_quality",
+        type=int,
+        default=95,
+        help="JPEG quality for optional RGB sequences when --rgb_sequence_format=jpeg.",
+    )
 
     # Temporal parameters
     parser.add_argument("--skip_every", type=int, default=5, help="Skip frames for clip generation")

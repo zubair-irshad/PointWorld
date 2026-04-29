@@ -158,8 +158,24 @@ class CameraDataExtractor:
             "mesh_trajectories": {},
             "extrinsic_trajectory": np.zeros((self.args.frames_per_clip, 4, 4), dtype=np.float32),
         }
+        if getattr(self.args, "store_rgb_sequence", False):
+            camera_data["rgb_sequence"] = np.zeros(
+                (self.args.frames_per_clip, rgb.shape[0], rgb.shape[1], 3),
+                dtype=np.uint8,
+            )
+            camera_data["rgb_sequence"][0] = rgb.astype(np.uint8)
         camera_data["extrinsic_trajectory"][0] = robot0_to_camera.astype(np.float32)
         return camera_data
+
+    def record_rgb_frame(self, clip_seed, obs, frame_idx):
+        """Record RGB for the current downsampled frame when photometric export is enabled."""
+        if not getattr(self.args, "store_rgb_sequence", False):
+            return
+        for camera_name, camera_data in clip_seed["cameras"].items():
+            if "rgb_sequence" not in camera_data:
+                continue
+            rgb = obs[f"external::{camera_name}::rgb"].cpu().numpy()[:, :, :3]
+            camera_data["rgb_sequence"][frame_idx] = np.asarray(rgb, dtype=np.uint8)
 
     def _extract_mesh_points(self, seg_ids, seg_info, world_points, colors, normals, world_to_robot, camera_name):
         """Extract points for each visible USD prim using seg_instance_id mapping."""

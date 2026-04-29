@@ -33,6 +33,7 @@ from shared.data_contract import (
     BEHAVIOR_CLIP_ATTRIBUTE_KEYS,
     EXPECTED_CAMERA_PAYLOAD_SHAPES,
     IMAGE_KEYS,
+    OPTIONAL_PHOTOMETRIC_KEYS,
     get_wds_data_keys,
     validate_domain,
 )
@@ -126,6 +127,17 @@ def _assert_camera_payload_contract(dataset: h5py.Dataset, modality: str, h5_pat
         )
 
 
+def _camera_image_extension(dataset: h5py.Dataset) -> str:
+    image_format = dataset.attrs.get("format", "jpeg")
+    if isinstance(image_format, bytes):
+        image_format = image_format.decode("utf-8")
+    if image_format == "jpeg":
+        return "jpg"
+    if image_format == "png":
+        return "png"
+    raise ValueError(f"Unsupported encoded RGB format in H5 dataset: {image_format}")
+
+
 def process_single_clip(
     h5_path: str,
     clip_key: str,
@@ -188,6 +200,22 @@ def process_single_clip(
                         sample[f"{camera_key}_{modality}.npy"] = _serialize_numpy(dataset[()])
                     else:
                         sample[f"{camera_key}_{modality}.npy"] = _serialize_numpy(dataset[:])
+            elif modality in OPTIONAL_PHOTOMETRIC_KEYS:
+                for camera_key in camera_keys:
+                    camera_data = clip_data[camera_key]
+                    assert modality in camera_data, f"Missing {modality} in {h5_path}/{clip_key}/{camera_key}"
+                    dataset = camera_data[modality]
+                    assert isinstance(dataset, h5py.Dataset), (
+                        f"Expected dataset for {modality} in {h5_path}/{clip_key}/{camera_key}, got {type(dataset)}"
+                    )
+                    if dataset.ndim != 1:
+                        raise AssertionError(
+                            f"Invalid {modality} shape in {h5_path}/{clip_key}/{camera_key}: "
+                            f"expected vlen sequence (T,), got {dataset.shape}"
+                        )
+                    ext = _camera_image_extension(dataset)
+                    for frame_idx in range(dataset.shape[0]):
+                        sample[f"{camera_key}_{modality}_{frame_idx:06d}.{ext}"] = dataset[frame_idx].tobytes()
             else:
                 assert modality in clip_data, f"Missing {modality} in {h5_path}/{clip_key}"
                 payload = clip_data[modality]
@@ -601,6 +629,14 @@ def main() -> None:
             "Generate with make_wds_manifest.py, or pass an existing release manifest explicitly."
         ),
     )
+    parser.add_argument(
+        "--include_future_rgb",
+        action="store_true",
+        help=(
+            "Include per-frame camera RGB sequences in WDS as "
+            "<camera>_rgb_<frame>.jpg/png. Requires generated H5 clips to contain camera/rgb."
+        ),
+    )
     args = parser.parse_args()
     validate_domain(args.domain)
 
@@ -610,7 +646,7 @@ def main() -> None:
     tasks = _parse_csv_arg(args.tasks)
     only_uuid_keywords = _parse_csv_arg(args.only_uuid_keywords)
 
-    data_keys = get_wds_data_keys(args.domain)
+    data_keys = get_wds_data_keys(args.domain, include_future_rgb=args.include_future_rgb)
 
     print(f"Starting conversion with rank={args.rank}, world_size={args.world_size}")
     preprocess_data(

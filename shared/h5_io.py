@@ -26,6 +26,33 @@ import h5py
 import numpy as np
 
 
+def _encode_rgb_image(rgb_image: np.ndarray, image_format: str, jpeg_quality: int = 95) -> np.ndarray:
+    import cv2
+
+    assert rgb_image.dtype == np.uint8, f"Expected uint8 RGB image, got {rgb_image.dtype}"
+    assert rgb_image.ndim == 3 and rgb_image.shape[2] == 3, f"Expected RGB image (H, W, 3), got {rgb_image.shape}"
+    if image_format == "jpeg":
+        assert 1 <= jpeg_quality <= 100, f"jpeg_quality must be in [1, 100], got {jpeg_quality}"
+        success, encoded_img = cv2.imencode(
+            ".jpg", rgb_image[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+        )
+    elif image_format == "png":
+        success, encoded_img = cv2.imencode(".png", rgb_image[..., ::-1])
+    else:
+        raise ValueError(f"Unsupported RGB image format: {image_format}")
+    assert success, f"Failed to encode image as {image_format}"
+    return np.frombuffer(encoded_img.tobytes(), dtype=np.uint8)
+
+
+def _decode_rgb_image(encoded: np.ndarray) -> np.ndarray:
+    import cv2
+
+    decoded_img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if decoded_img is None:
+        raise RuntimeError("Failed to decode RGB image data")
+    return decoded_img[..., ::-1]
+
+
 def save_rgb_as_jpeg_in_h5(group: h5py.Group, dataset_name: str, rgb_image: np.ndarray, jpeg_quality: int = 95) -> None:
     """
     Save RGB image as JPEG binary data in HDF5 dataset.
@@ -36,18 +63,7 @@ def save_rgb_as_jpeg_in_h5(group: h5py.Group, dataset_name: str, rgb_image: np.n
         rgb_image: RGB image as numpy array (H, W, 3) uint8.
         jpeg_quality: JPEG compression quality (1-100).
     """
-    import cv2
-
-    assert rgb_image.dtype == np.uint8, f"Expected uint8 RGB image, got {rgb_image.dtype}"
-    assert rgb_image.ndim == 3 and rgb_image.shape[2] == 3, f"Expected RGB image (H, W, 3), got {rgb_image.shape}"
-    assert 1 <= jpeg_quality <= 100, f"jpeg_quality must be in [1, 100], got {jpeg_quality}"
-
-    success, encoded_img = cv2.imencode(
-        ".jpg", rgb_image[..., ::-1], [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
-    )
-    assert success, "Failed to encode image as JPEG"
-
-    jpeg_data = np.frombuffer(encoded_img.tobytes(), dtype=np.uint8)
+    jpeg_data = _encode_rgb_image(rgb_image, image_format="jpeg", jpeg_quality=jpeg_quality)
     dt = h5py.special_dtype(vlen=np.dtype("uint8"))
     dset = group.create_dataset(dataset_name, (1,), dtype=dt)
     dset[0] = jpeg_data
@@ -55,6 +71,39 @@ def save_rgb_as_jpeg_in_h5(group: h5py.Group, dataset_name: str, rgb_image: np.n
     dset.attrs["format"] = "jpeg"
     dset.attrs["quality"] = jpeg_quality
     dset.attrs["original_shape"] = rgb_image.shape
+
+
+def save_rgb_sequence_in_h5(
+    group: h5py.Group,
+    dataset_name: str,
+    rgb_sequence: np.ndarray,
+    image_format: str = "jpeg",
+    jpeg_quality: int = 95,
+) -> None:
+    """
+    Save an RGB video clip as a variable-length encoded image sequence.
+
+    Args:
+        group: HDF5 group to save to.
+        dataset_name: Name of the dataset.
+        rgb_sequence: RGB array with shape (T, H, W, 3), uint8.
+        image_format: "jpeg" or "png".
+        jpeg_quality: JPEG quality when image_format == "jpeg".
+    """
+    seq = np.asarray(rgb_sequence)
+    assert seq.dtype == np.uint8, f"Expected uint8 RGB sequence, got {seq.dtype}"
+    assert seq.ndim == 4 and seq.shape[-1] == 3, f"Expected RGB sequence (T,H,W,3), got {seq.shape}"
+    assert seq.shape[0] > 0, "RGB sequence must contain at least one frame"
+
+    dt = h5py.special_dtype(vlen=np.dtype("uint8"))
+    dset = group.create_dataset(dataset_name, (seq.shape[0],), dtype=dt)
+    for frame_idx, frame in enumerate(seq):
+        dset[frame_idx] = _encode_rgb_image(frame, image_format=image_format, jpeg_quality=jpeg_quality)
+    dset.attrs["write_complete"] = True
+    dset.attrs["format"] = image_format
+    if image_format == "jpeg":
+        dset.attrs["quality"] = jpeg_quality
+    dset.attrs["original_shape"] = seq.shape
 
 
 def load_rgb_from_jpeg_in_h5(dataset: h5py.Dataset) -> np.ndarray:
@@ -67,13 +116,12 @@ def load_rgb_from_jpeg_in_h5(dataset: h5py.Dataset) -> np.ndarray:
     Returns:
         RGB image as numpy array (H, W, 3) uint8.
     """
-    import cv2
+    return _decode_rgb_image(dataset[0])
 
-    jpeg_data = dataset[0]
-    decoded_img = cv2.imdecode(jpeg_data, cv2.IMREAD_COLOR)
-    if decoded_img is None:
-        raise RuntimeError("Failed to decode JPEG data")
-    return decoded_img[..., ::-1]
+
+def load_rgb_sequence_from_h5(dataset: h5py.Dataset) -> np.ndarray:
+    """Load an RGB image sequence saved by save_rgb_sequence_in_h5."""
+    return np.stack([_decode_rgb_image(dataset[i]) for i in range(dataset.shape[0])], axis=0)
 
 
 def save_depth_as_uint16_mm(group: h5py.Group, dataset_name: str, depth_image_meters: np.ndarray) -> None:

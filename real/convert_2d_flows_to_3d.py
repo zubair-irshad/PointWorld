@@ -43,7 +43,13 @@ MAX_DEPTH_M = 4.0
 URDF_PATH = "../assets/franka_description/franka_panda_robotiq_2f85.urdf"
 from real.flow_postprocessing import remove_outlier_flows
 from shared.data_contract import EXPECTED_CAMERA_PAYLOAD_SHAPES
-from shared.h5_io import load_rgb_from_jpeg_in_h5, save_rgb_as_jpeg_in_h5, save_depth_as_uint16_mm
+from shared.h5_io import (
+    load_rgb_from_jpeg_in_h5,
+    load_rgb_sequence_from_h5,
+    save_depth_as_uint16_mm,
+    save_rgb_as_jpeg_in_h5,
+    save_rgb_sequence_in_h5,
+)
 
 QUANTIZED_NORMALS_DTYPE = np.int8
 
@@ -79,6 +85,13 @@ def _resize_initial_rgb_to_contract(rgb_image: np.ndarray) -> np.ndarray:
     if rgb_u8.shape[:2] == (target_h, target_w):
         return rgb_u8
     return cv2.resize(rgb_u8, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+def _resize_rgb_sequence_to_contract(rgb_sequence: np.ndarray) -> np.ndarray:
+    seq = np.asarray(rgb_sequence)
+    if seq.ndim != 4 or seq.shape[-1] != 3:
+        raise ValueError(f"Expected RGB sequence with shape (T,H,W,3), got {seq.shape}")
+    return np.stack([_resize_initial_rgb_to_contract(frame) for frame in seq], axis=0)
 
 
 def _scale_intrinsic_for_resolution(
@@ -178,6 +191,10 @@ class Flow2DTo3DConverter:
             ee_rot_threshold = float(f.attrs['ee_rot_threshold'])
             gripper_closed_ee_pos_threshold = float(f.attrs['gripper_closed_ee_pos_threshold'])
             gripper_closed_ee_rot_threshold = float(f.attrs['gripper_closed_ee_rot_threshold'])
+            rgb_sequence_format = f.attrs.get('rgb_sequence_format', 'jpeg')
+            if isinstance(rgb_sequence_format, (bytes, bytearray)):
+                rgb_sequence_format = rgb_sequence_format.decode('utf-8')
+            rgb_jpeg_quality = int(f.attrs.get('rgb_jpeg_quality', 95))
             cams = {}
             for cam_key in f['cameras'].keys():
                 g_cam = f['cameras'][cam_key]
@@ -194,6 +211,8 @@ class Flow2DTo3DConverter:
                         'flow_colors': np.array(g_clip['flow_colors']).astype(np.uint8),
                         'initial_rgb': initial_rgb.astype(np.uint8),
                     }
+                    if 'rgb' in g_clip:
+                        clip['rgb_sequence'] = load_rgb_sequence_from_h5(g_clip['rgb']).astype(np.uint8)
                     clips[clip_key] = clip
                 cams[cam_key] = {'intrinsic': intrinsic, 'clips': clips}
 
@@ -223,6 +242,8 @@ class Flow2DTo3DConverter:
             'ee_rot_threshold': ee_rot_threshold,
             'gripper_closed_ee_pos_threshold': gripper_closed_ee_pos_threshold,
             'gripper_closed_ee_rot_threshold': gripper_closed_ee_rot_threshold,
+            'rgb_sequence_format': str(rgb_sequence_format),
+            'rgb_jpeg_quality': int(rgb_jpeg_quality),
             'cameras': cams,
             'proprio': proprio,
         }
@@ -497,6 +518,8 @@ class Flow2DTo3DConverter:
             f.attrs['ee_rot_threshold'] = ee_rot_threshold
             f.attrs['gripper_closed_ee_pos_threshold'] = gripper_closed_ee_pos_threshold
             f.attrs['gripper_closed_ee_rot_threshold'] = gripper_closed_ee_rot_threshold
+            f.attrs['rgb_sequence_format'] = processed_data_dict.get('rgb_sequence_format', 'jpeg')
+            f.attrs['rgb_jpeg_quality'] = int(processed_data_dict.get('rgb_jpeg_quality', 95))
             for clip_key, clip_data in processed_data_dict.items():
                 if ':' not in clip_key:
                     continue
@@ -533,7 +556,12 @@ class Flow2DTo3DConverter:
                             dset = camera_group.create_dataset(key, data=data.astype(np.bool_), compression=None)
                         dset.attrs['write_complete'] = True
 
-                    initial_rgb_src = np.asarray(clip_data[f'{camera_prefix}_rgb'][0])
+                    rgb_sequence_src = np.asarray(clip_data[f'{camera_prefix}_rgb'])
+                    if rgb_sequence_src.ndim != 4 or rgb_sequence_src.shape[-1] != 3:
+                        raise ValueError(
+                            f"Expected {camera_prefix}_rgb with shape (T,H,W,3), got {rgb_sequence_src.shape}"
+                        )
+                    initial_rgb_src = rgb_sequence_src[0]
                     initial_depth_src = np.asarray(clip_data[f'{camera_prefix}_depth'][0], dtype=np.float32)
                     if initial_depth_src.ndim != 2:
                         raise ValueError(
@@ -552,6 +580,7 @@ class Flow2DTo3DConverter:
                         )
 
                     initial_rgb = _resize_initial_rgb_to_contract(initial_rgb_src)
+                    rgb_sequence = _resize_rgb_sequence_to_contract(rgb_sequence_src)
                     initial_depth = _resize_initial_depth_to_contract(initial_depth_src)
                     intrinsic_src = np.asarray(clip_data[f'{camera_prefix}_intrinsic'], dtype=np.float32)
                     intrinsic = _scale_intrinsic_for_resolution(
@@ -567,6 +596,17 @@ class Flow2DTo3DConverter:
                     dset.attrs['write_complete'] = True
 
                     save_rgb_as_jpeg_in_h5(camera_group, 'initial_rgb', initial_rgb)
+                    if rgb_sequence.shape[0] > 1:
+                        camera_group.attrs['has_rgb_sequence'] = True
+                        save_rgb_sequence_in_h5(
+                            camera_group,
+                            'rgb',
+                            rgb_sequence,
+                            image_format=processed_data_dict.get('rgb_sequence_format', 'jpeg'),
+                            jpeg_quality=int(processed_data_dict.get('rgb_jpeg_quality', 95)),
+                        )
+                    else:
+                        camera_group.attrs['has_rgb_sequence'] = False
                     save_depth_as_uint16_mm(camera_group, 'initial_depth', initial_depth)
     
     def _estimate_normals(self, pts_world, world2cam):
@@ -652,6 +692,8 @@ class Flow2DTo3DConverter:
         processed = {
             'uuid': uuid,
             'canonical_timestamps': timestamps,
+            'rgb_sequence_format': cache.get('rgb_sequence_format', 'jpeg'),
+            'rgb_jpeg_quality': int(cache.get('rgb_jpeg_quality', 95)),
         }
 
         # Iterate cameras
@@ -795,8 +837,13 @@ class Flow2DTo3DConverter:
                     processed[clip_key][f'{camera_prefix}_scene_normals'] = normals.astype(np.float32)
                     processed[clip_key][f'{camera_prefix}_scene_visibility'] = vis.astype(bool)
                     processed[clip_key][f'{camera_prefix}_scene_depth_valid_mask'] = depth_valid.astype(bool)
-                    # Minimal rgb/depth (first frame only) for writer compatibility
-                    processed[clip_key][f'{camera_prefix}_rgb'] = c['initial_rgb'][None].astype(np.uint8)
+                    # RGB sequence is optional and used for photometric supervision.
+                    # Geometry-only releases keep only the first frame.
+                    processed[clip_key][f'{camera_prefix}_rgb'] = (
+                        c['rgb_sequence'].astype(np.uint8)
+                        if 'rgb_sequence' in c
+                        else c['initial_rgb'][None].astype(np.uint8)
+                    )
                     # Use sanitized first-frame depth grid
                     processed[clip_key][f'{camera_prefix}_depth'] = first_depth_grid.astype(np.float32)
                     processed[clip_key][f'{camera_prefix}_intrinsic'] = K_lift.astype(np.float32)

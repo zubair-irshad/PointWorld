@@ -27,7 +27,7 @@ from real.droid_utils import (
     filter_by_timestamps,
     get_uuid,
 )
-from shared.h5_io import save_rgb_as_jpeg_in_h5
+from shared.h5_io import save_rgb_as_jpeg_in_h5, save_rgb_sequence_in_h5
 from real.flow_2d import Flow2DTracker, COTRACKER_CKPT_PATH
 
 
@@ -62,6 +62,9 @@ class TrackCacheRunner(Flow2DTracker):
         gripper_threshold=0.1,
         gripper_closed_ee_pos_threshold=0.10,
         gripper_closed_ee_rot_threshold=np.deg2rad(60),
+        store_rgb_sequence=False,
+        rgb_sequence_format="jpeg",
+        rgb_jpeg_quality=95,
     ):
         self.output_dir = save_dir
         self.scene_path = scene_path
@@ -155,6 +158,9 @@ class TrackCacheRunner(Flow2DTracker):
             'gripper_closed_ee_pos_threshold': float(gripper_closed_ee_pos_threshold),
             'gripper_closed_ee_rot_threshold': float(gripper_closed_ee_rot_threshold),
             'gripper_threshold': float(gripper_threshold),
+            'store_rgb_sequence': bool(store_rgb_sequence),
+            'rgb_sequence_format': str(rgb_sequence_format),
+            'rgb_jpeg_quality': int(rgb_jpeg_quality),
         }
 
         # Organize per-camera, per-clip cache
@@ -208,6 +214,8 @@ class TrackCacheRunner(Flow2DTracker):
                     'flow_colors': flow_colors.astype(np.uint8),
                     'first_frame_rgb': first_rgb.astype(np.uint8),
                 }
+                if store_rgb_sequence:
+                    payload_by_camera[cam_key]['clips'][clip_key]['rgb_sequence'] = rgb_seq.astype(np.uint8)
 
         # Store proprio per-clip (minimal set for later masks)
         proprio_by_clip = {}
@@ -250,6 +258,9 @@ class TrackCacheRunner(Flow2DTracker):
             f.attrs['gripper_closed_ee_pos_threshold'] = float(meta['gripper_closed_ee_pos_threshold'])
             f.attrs['gripper_closed_ee_rot_threshold'] = float(meta['gripper_closed_ee_rot_threshold'])
             f.attrs['gripper_threshold'] = float(meta['gripper_threshold'])
+            f.attrs['store_rgb_sequence'] = bool(meta.get('store_rgb_sequence', False))
+            f.attrs['rgb_sequence_format'] = str(meta.get('rgb_sequence_format', 'jpeg'))
+            f.attrs['rgb_jpeg_quality'] = int(meta.get('rgb_jpeg_quality', 95))
             f.attrs['write_complete'] = False
 
             # Cameras and clips
@@ -267,6 +278,14 @@ class TrackCacheRunner(Flow2DTracker):
                     g_clip.create_dataset('flow_colors', data=clip_data['flow_colors'].astype(np.uint8))
                     # Also store the first RGB frame for writer compatibility in converter
                     save_rgb_as_jpeg_in_h5(g_clip, 'initial_rgb', clip_data['first_frame_rgb'].astype(np.uint8))
+                    if 'rgb_sequence' in clip_data:
+                        save_rgb_sequence_in_h5(
+                            g_clip,
+                            'rgb',
+                            clip_data['rgb_sequence'].astype(np.uint8),
+                            image_format=str(meta.get('rgb_sequence_format', 'jpeg')),
+                            jpeg_quality=int(meta.get('rgb_jpeg_quality', 95)),
+                        )
 
             # Proprio per-clip
             proprio_group = f.create_group('proprio')
@@ -314,6 +333,23 @@ def main():
     parser.add_argument('--gripper_threshold', type=float, default=0.1)
     parser.add_argument('--gripper_closed_ee_pos_threshold', type=float, default=0.10)
     parser.add_argument('--gripper_closed_ee_rot_threshold', type=float, default=np.deg2rad(60))
+    parser.add_argument(
+        '--store_rgb_sequence',
+        action='store_true',
+        help='Store full per-clip RGB frame sequences in the 2D track cache for photometric supervision.',
+    )
+    parser.add_argument(
+        '--rgb_sequence_format',
+        choices=['jpeg', 'png'],
+        default='jpeg',
+        help='Encoding format for optional RGB sequences.',
+    )
+    parser.add_argument(
+        '--rgb_jpeg_quality',
+        type=int,
+        default=95,
+        help='JPEG quality for optional RGB sequences when --rgb_sequence_format=jpeg.',
+    )
     parser.add_argument(
         '--allow_gcs_streaming',
         action='store_true',
@@ -368,6 +404,9 @@ def main():
             gripper_threshold=args.gripper_threshold,
             gripper_closed_ee_pos_threshold=args.gripper_closed_ee_pos_threshold,
             gripper_closed_ee_rot_threshold=args.gripper_closed_ee_rot_threshold,
+            store_rgb_sequence=args.store_rgb_sequence,
+            rgb_sequence_format=args.rgb_sequence_format,
+            rgb_jpeg_quality=args.rgb_jpeg_quality,
         )
         tqdm.write(f"[{get_time_str()}] Done with scene {get_uuid(scene_path)}: status={ok}")
 

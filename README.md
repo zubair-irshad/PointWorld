@@ -276,6 +276,9 @@ python real/compute_2d_flows.py \
   --output_dir "$DROID_ROOT" \
   --cotracker_ckpt checkpoints/cotracker/scaled_online.pth
 
+# For photometric-dynamics experiments, append:
+#   --store_rgb_sequence --rgb_sequence_format png
+
 # 3D flows
 python real/convert_2d_flows_to_3d.py \
   --input "$DROID_FLOW_INPUT" \
@@ -322,6 +325,11 @@ docker run --rm --gpus all --ipc=host --ulimit core=0 \
     --world_size 1"
 ```
 
+For photometric-dynamics experiments, add `--store_rgb_sequence` and optionally
+`--rgb_sequence_format png` inside the container command. This records every
+downsampled RGB frame for each generated clip so WDS conversion can export
+future-image targets.
+
 On the first run, OmniGibson/Isaac extension sync, shader compilation, and scene material setup may take several minutes before frame processing begins.
 
 <a id="build-train-eval-datasets-from-generated-h5"></a>
@@ -358,6 +366,18 @@ python convert_wds.py \
   --manifest /path/to/droid/flows-fs-optimize/wds_manifest_seed42_test0.1.json
 ```
 
+If the generated H5 clips include RGB sequences, pass `--include_future_rgb` to
+write per-frame keys such as `camera_<id>_rgb_000000.png` into WDS.
+
+```bash
+python convert_wds.py \
+  --input_dir /path/to/droid/flows-fs-optimize \
+  --output_dir /path/to/droid/wds \
+  --domain droid \
+  --manifest /path/to/droid/flows-fs-optimize/wds_manifest_seed42_test0.1.json \
+  --include_future_rgb
+```
+
 To match the test split from the paper, pass the release manifest directly instead of generating one:
 
 ```bash
@@ -387,6 +407,18 @@ python convert_wds.py \
   --output_dir /path/to/behavior/wds \
   --domain behavior \
   --manifest /path/to/behavior/flows/wds_manifest_seed42_test0.1.json
+```
+
+If the generated H5 clips include RGB sequences, pass `--include_future_rgb` to
+export future RGB frame targets into WDS.
+
+```bash
+python convert_wds.py \
+  --input_dir /path/to/behavior/flows \
+  --output_dir /path/to/behavior/wds \
+  --domain behavior \
+  --manifest /path/to/behavior/flows/wds_manifest_seed42_test0.1.json \
+  --include_future_rgb
 ```
 
 To match the test split from the paper, pass the release manifest directly instead of generating one:

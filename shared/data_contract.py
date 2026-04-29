@@ -25,6 +25,10 @@ IMAGE_KEYS = [
     "extrinsic",
 ]
 
+OPTIONAL_PHOTOMETRIC_KEYS = [
+    "rgb",
+]
+
 EXPECTED_CAMERA_PAYLOAD_SHAPES = {
     "initial_depth": (180, 320),
     "intrinsic": (3, 3),
@@ -61,7 +65,7 @@ def validate_domain(domain: str) -> None:
         raise ValueError(f"Unsupported domain: {domain}")
 
 
-def get_wds_data_keys(domain: str) -> List[str]:
+def get_wds_data_keys(domain: str, include_future_rgb: bool = False) -> List[str]:
     validate_domain(domain)
     if domain == "behavior":
         keys = [
@@ -90,4 +94,7 @@ def get_wds_data_keys(domain: str) -> List[str]:
             "gripper_positions",
         ]
     # Policy: droid/behavior always include camera image + matrix payloads.
-    return keys + IMAGE_KEYS
+    out = keys + IMAGE_KEYS
+    if include_future_rgb:
+        out += OPTIONAL_PHOTOMETRIC_KEYS
+    return out

@@ -26,7 +26,7 @@ import h5py
 import numpy as np
 
 from shared.data_contract import EXPECTED_CAMERA_PAYLOAD_SHAPES
-from shared.h5_io import save_depth_as_uint16_mm, save_rgb_as_jpeg_in_h5
+from shared.h5_io import save_depth_as_uint16_mm, save_rgb_as_jpeg_in_h5, save_rgb_sequence_in_h5
 
 
 def _quantize_unit_normals_to_int8(normals: np.ndarray) -> np.ndarray:
@@ -87,13 +87,37 @@ def _normalize_camera_payload_to_contract(
     return rgb_resized, depth_resized, intr_scaled
 
 
+def _normalize_rgb_sequence_to_contract(rgb_sequence: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
+    seq = np.asarray(rgb_sequence)
+    if seq.ndim != 4 or seq.shape[-1] != 3:
+        raise ValueError(f"Expected rgb_sequence with shape (T,H,W,3), got {seq.shape}")
+    if seq.dtype != np.uint8:
+        seq = np.clip(seq, 0, 255).astype(np.uint8)
+    target_h, target_w = target_hw
+    if seq.shape[1:3] == (target_h, target_w):
+        return seq
+    return np.stack(
+        [cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA) for frame in seq],
+        axis=0,
+    )
+
+
 class ClipWriter:
     """Write per-clip H5 files and aggregate to a final episode H5."""
 
-    def __init__(self, output_file: str, get_joint_names_fn, source_file: str):
+    def __init__(
+        self,
+        output_file: str,
+        get_joint_names_fn,
+        source_file: str,
+        rgb_sequence_format: str = "jpeg",
+        rgb_jpeg_quality: int = 95,
+    ):
         self._output_file = output_file
         self._get_joint_names = get_joint_names_fn
         self._source_file = source_file
+        self._rgb_sequence_format = rgb_sequence_format
+        self._rgb_jpeg_quality = int(rgb_jpeg_quality)
         self._temp_dir = self._derive_temp_dir(output_file)
 
     @staticmethod
@@ -231,6 +255,21 @@ class ClipWriter:
                 dset.attrs["write_complete"] = True
 
                 save_rgb_as_jpeg_in_h5(camera_group, "initial_rgb", initial_rgb)
+                if "rgb_sequence" in camera_data:
+                    rgb_sequence = _normalize_rgb_sequence_to_contract(
+                        camera_data["rgb_sequence"],
+                        target_hw=initial_rgb.shape[:2],
+                    )
+                    camera_group.attrs["has_rgb_sequence"] = True
+                    save_rgb_sequence_in_h5(
+                        camera_group,
+                        "rgb",
+                        rgb_sequence,
+                        image_format=getattr(self, "_rgb_sequence_format", "jpeg"),
+                        jpeg_quality=getattr(self, "_rgb_jpeg_quality", 95),
+                    )
+                else:
+                    camera_group.attrs["has_rgb_sequence"] = False
                 save_depth_as_uint16_mm(camera_group, "initial_depth", initial_depth)
 
                 camera_group.attrs["num_scene_points"] = scene_points_count
