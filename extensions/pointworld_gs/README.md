@@ -63,6 +63,8 @@ The script exposes:
 - `renderer.py`: `gsplat` 3DGS renderer plus pure-PyTorch surfel fallback.
 - `viz.py`: image/grid writing helpers.
 - `overfit_scene.py`: training entry point.
+- `visualize_dataset.py`: WDS/RGB/3D-flow alignment visualizer that uses the
+  same sample loader as the trainer.
 
 ## Renderer backends
 
@@ -276,6 +278,40 @@ python extensions/pointworld_gs/overfit_scene.py \
 The template gets `camera`, `cam`, `t`, and `frame` variables. For example,
 `{camera}_rgb_{t:06d}` with selected camera `camera_0` reads
 `camera_0_rgb_000000`, `camera_0_rgb_000001`, and so on.
+
+## Dataset alignment visualization
+
+Before overfitting, inspect whether the RGB frames and PointWorld trajectories
+are indexed consistently:
+
+```bash
+python extensions/pointworld_gs/visualize_dataset.py \
+  --domain droid \
+  --data_dir "$DROID_ROOT/wds" \
+  --split test \
+  --sample_index 0 \
+  --render_scale 0.5 \
+  --max_frames 11 \
+  --max_scene_points 50000 \
+  --output_dir outputs/pointworld_gs/droid_sample0_dataset_viz
+```
+
+Use the same `--sample_index`, `--camera_prefix`, `--render_scale`,
+`--max_frames`, and future-RGB flags as the overfit run. The output includes:
+
+- `rgb_montage.png`: raw RGB sequence in frame order;
+- `frame_*_points.png`: current 3D trajectory points projected onto `rgb[t]`;
+- `frame_*_step_flow.png`: projected `t-1 -> t` flow arrows colored by 2D
+  direction and magnitude;
+- `frame_*_chunk_flow.png`: projected `0 -> t` chunk flow arrows;
+- `dataset_alignment.mp4`: a side-by-side video with per-frame visibility and
+  motion statistics;
+- `alignment_report.json`: sample key, selected camera, point counts, and
+  frame-wise motion/visibility numbers.
+
+By default this visualizes only the original trajectory points. Add
+`--augment_initial_depth_points --include_depth_augmented_points` if you want
+the same dense static RGB-D augmentation used by the high-coverage GS overfit.
 
 ## Outputs
 
