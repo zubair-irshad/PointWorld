@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import re
+import io
+import pickle
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 
 import cv2
@@ -14,19 +15,7 @@ import numpy as np
 import torch
 import webdataset as wds
 
-from dataset_components.decoders import build_flow_sample, decode_data
-from dataset_components.transforms import (
-    assert_camera_payload_resolution,
-    center_shift,
-    compute_helper_variables,
-    enforce_max_num_points,
-    filter_within_bounds,
-    grid_sample_transform,
-    make_gt_copy,
-    normalize_colors,
-)
-from robot_sampler import RobotSampler as TorchRobotSampler
-from utils import resolve_robot_urdf
+import transform_utils
 
 
 @dataclass
@@ -54,10 +43,8 @@ def list_shards(data_dir: str, split: str) -> list[str]:
 
 def load_raw_sample(data_dir: str, split: str, sample_index: int, domain: str) -> dict:
     shards = list_shards(data_dir, split)
-    dataset = wds.WebDataset(shards, shardshuffle=False, handler=wds.warn_and_continue).map(
-        partial(decode_data, domain=domain),
-        handler=wds.warn_and_continue,
-    )
+    del domain
+    dataset = wds.WebDataset(shards, shardshuffle=False, handler=wds.warn_and_continue)
     for idx, sample in enumerate(dataset):
         if idx == sample_index:
             return sample
@@ -67,10 +54,12 @@ def load_raw_sample(data_dir: str, split: str, sample_index: int, domain: str) -
 def _camera_prefixes_from_sample(sample: dict) -> list[str]:
     prefixes = set()
     for key in sample.keys():
-        if key.endswith("_initial_rgb"):
-            prefixes.add(key[: -len("_initial_rgb")])
+        if key.endswith("_initial_rgb.jpg") or key.endswith("_initial_rgb.png"):
+            prefixes.add(key.rsplit("_initial_rgb.", 1)[0])
         elif "_scene_flows" in key:
             prefixes.add(key.split("_scene_flows")[0])
+        elif "_local_scene_points" in key:
+            prefixes.add(key.split("_local_scene_points")[0])
     return sorted(prefixes)
 
 
@@ -99,6 +88,120 @@ def _decode_rgb_value(value) -> np.ndarray:
             raise RuntimeError("Failed to decode RGB image bytes")
         return decoded[..., ::-1]
     raise TypeError(f"Unsupported RGB value type: {type(value)}")
+
+
+def _load_npy_value(value) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        with io.BytesIO(bytes(value)) as f:
+            return np.load(f, allow_pickle=False)
+    raise TypeError(f"Unsupported npy value type: {type(value)}")
+
+
+def _load_pickle_value(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return pickle.loads(bytes(value))
+    raise TypeError(f"Unsupported pickle value type: {type(value)}")
+
+
+def _get_sample_value(sample: dict, *candidates: str, required: bool = True):
+    for key in candidates:
+        if key in sample:
+            return sample[key]
+    if required:
+        raise KeyError(f"Missing any of keys: {candidates}")
+    return None
+
+
+def _to_uint8_colors(colors: np.ndarray) -> np.ndarray:
+    arr = np.asarray(colors)
+    if arr.dtype == np.uint8:
+        return arr
+    if arr.size == 0:
+        return arr.astype(np.uint8)
+    arr_f = arr.astype(np.float32)
+    if float(np.nanmax(arr_f)) <= 1.0 + 1e-6:
+        arr_f = arr_f * 255.0
+    return np.clip(arr_f, 0.0, 255.0).astype(np.uint8)
+
+
+def _ensure_temporal_colors(colors: np.ndarray, num_frames: int) -> np.ndarray:
+    colors = _to_uint8_colors(colors)
+    if colors.ndim == 2:
+        if colors.shape[1] != 3:
+            raise ValueError(f"scene colors must have shape N,3 or T,N,3, got {colors.shape}")
+        return np.broadcast_to(colors[None], (num_frames, colors.shape[0], 3)).copy()
+    if colors.ndim == 3 and colors.shape[0] == num_frames and colors.shape[2] == 3:
+        return colors
+    raise ValueError(f"scene colors must have shape N,3 or T,N,3 aligned to T={num_frames}, got {colors.shape}")
+
+
+def _subsample_points(
+    positions: np.ndarray,
+    colors: np.ndarray,
+    max_points: int | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if max_points is None or max_points <= 0 or positions.shape[1] <= max_points:
+        return positions, colors
+    rng = np.random.RandomState(seed)
+    keep = np.sort(rng.choice(positions.shape[1], size=max_points, replace=False))
+    return positions[:, keep], colors[:, keep]
+
+
+def _load_camera_rgb(sample: dict, camera_prefix: str) -> np.ndarray:
+    value = _get_sample_value(
+        sample,
+        f"{camera_prefix}_initial_rgb.jpg",
+        f"{camera_prefix}_initial_rgb.png",
+    )
+    return _decode_rgb_value(value)
+
+
+def _load_droid_scene(sample: dict, camera_prefix: str) -> tuple[np.ndarray, np.ndarray]:
+    positions = _load_npy_value(_get_sample_value(sample, f"{camera_prefix}_scene_flows.npy")).astype(np.float32)
+    colors = _load_npy_value(_get_sample_value(sample, f"{camera_prefix}_scene_colors.npy"))
+    if positions.ndim != 3 or positions.shape[-1] != 3:
+        raise ValueError(f"{camera_prefix}_scene_flows must have shape T,N,3, got {positions.shape}")
+    return positions, _ensure_temporal_colors(colors, int(positions.shape[0]))
+
+
+def _load_behavior_scene(sample: dict, camera_prefix: str) -> tuple[np.ndarray, np.ndarray]:
+    local_points = _load_pickle_value(_get_sample_value(sample, f"{camera_prefix}_local_scene_points.pyd"))
+    local_colors = _load_pickle_value(_get_sample_value(sample, f"{camera_prefix}_local_scene_colors.pyd"))
+    trajectories = _load_pickle_value(_get_sample_value(sample, f"{camera_prefix}_scene_mesh_trajectories.pyd"))
+
+    mesh_names = sorted(set(local_points.keys()) & set(local_colors.keys()) & set(trajectories.keys()))
+    if not mesh_names:
+        raise RuntimeError(f"No common behavior mesh payloads found for {camera_prefix}")
+
+    all_points = []
+    all_colors = []
+    num_frames = None
+    for mesh_name in mesh_names:
+        points = np.asarray(local_points[mesh_name], dtype=np.float32)
+        colors = _to_uint8_colors(np.asarray(local_colors[mesh_name]))
+        poses = np.asarray(trajectories[mesh_name], dtype=np.float32)
+        if points.ndim != 2 or points.shape[-1] != 3:
+            raise ValueError(f"local_scene_points[{mesh_name}] must be N,3, got {points.shape}")
+        if colors.ndim != 2 or colors.shape[-1] != 3:
+            raise ValueError(f"local_scene_colors[{mesh_name}] must be N,3, got {colors.shape}")
+        if poses.ndim != 2 or poses.shape[-1] != 7:
+            raise ValueError(f"scene_mesh_trajectories[{mesh_name}] must be T,7, got {poses.shape}")
+
+        pose_mats = np.asarray(transform_utils.convert_pose_quat2mat(poses), dtype=np.float32)
+        mesh_frames = int(pose_mats.shape[0])
+        if num_frames is None:
+            num_frames = mesh_frames
+        elif mesh_frames != num_frames:
+            raise ValueError(f"Inconsistent behavior trajectory length: {mesh_frames} vs {num_frames}")
+
+        world_points = np.einsum("tij,nj->tni", pose_mats[:, :3, :3], points) + pose_mats[:, None, :3, 3]
+        all_points.append(world_points.astype(np.float32, copy=False))
+        all_colors.append(np.broadcast_to(colors[None], (mesh_frames, colors.shape[0], 3)).copy())
+
+    return np.concatenate(all_points, axis=1), np.concatenate(all_colors, axis=1)
 
 
 def load_future_rgb_from_wds(
@@ -219,57 +322,6 @@ def resize_rgb_to_hw(rgb: torch.Tensor, height: int, width: int) -> torch.Tensor
     return resized_t[0] if rgb.ndim == 3 else resized_t
 
 
-def prepare_release_sample(raw: dict, args, selected_camera: str) -> dict:
-    robot_sampler = TorchRobotSampler(
-        urdf_path=resolve_robot_urdf(args.domain),
-        gripper_only=False,
-        device="cpu",
-    )
-
-    sample = build_flow_sample(
-        raw,
-        domain=args.domain,
-        robot_sampler=robot_sampler,
-        max_robot_points=args.max_robot_points,
-        deterministic=True,
-        seed=args.seed,
-        force_single_arm=False,
-    )
-
-    # Avoid random camera selection here so that future-RGB extraction and
-    # release camera preprocessing use the same view.
-    for key in list(sample.keys()):
-        if key.startswith(f"{selected_camera}_"):
-            sample[f"cam0_{key[len(selected_camera) + 1:]}"] = sample[key]
-
-    scene_attributes = set()
-    for key in list(sample.keys()):
-        if key.startswith(f"{selected_camera}_scene_"):
-            scene_attributes.add(key[len(selected_camera) + 1 :])
-    for attr in scene_attributes:
-        sample[attr] = sample[f"{selected_camera}_{attr}"]
-
-    sample = center_shift(sample)
-    sample = filter_within_bounds(sample)
-    sample = assert_camera_payload_resolution(sample, expected_hw=(180, 320))
-    sample = grid_sample_transform(sample, grid_size=args.grid_size, mode="test")
-    sample = enforce_max_num_points(
-        sample,
-        max_scene_points=args.max_scene_points,
-        deterministic=True,
-        seed=args.seed,
-    )
-    sample = center_shift(sample)
-    sample = normalize_colors(sample)
-    sample = make_gt_copy(sample)
-    sample = compute_helper_variables(
-        sample,
-        max_relative_movement=args.max_relative_movement,
-        domain=args.domain,
-    )
-    return sample
-
-
 def _to_tensor(array: np.ndarray, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.as_tensor(array, device=device, dtype=dtype)
 
@@ -283,16 +335,23 @@ def load_scene_bundle(args) -> SceneBundle:
     if future_rgb is None:
         future_rgb = load_future_rgb_from_wds(raw, selected_camera, args.future_rgb_key_template, args.max_frames)
 
-    sample = prepare_release_sample(raw, args, selected_camera)
-    positions = _to_tensor(sample["gt_scene_flows"], device)
-    colors = _to_tensor(sample["scene_colors"], device).clamp(0.0, 1.0)
+    if args.domain == "droid":
+        positions_np, colors_np = _load_droid_scene(raw, selected_camera)
+    elif args.domain == "behavior":
+        positions_np, colors_np = _load_behavior_scene(raw, selected_camera)
+    else:
+        raise ValueError(f"Unsupported domain: {args.domain}")
+
+    positions_np, colors_np = _subsample_points(positions_np, colors_np, args.max_scene_points, args.seed)
+    positions = _to_tensor(positions_np, device)
+    colors = _to_tensor(colors_np, device).clamp(0.0, 255.0) / 255.0
     if args.max_frames is not None:
         positions = positions[: args.max_frames]
         colors = colors[: args.max_frames]
 
-    initial_rgb = _to_tensor(sample["cam0_initial_rgb"], device) / 255.0
-    intrinsic = _to_tensor(sample["cam0_intrinsic"], device)
-    extrinsic = _to_tensor(sample["cam0_extrinsic"], device)
+    initial_rgb = _to_tensor(_load_camera_rgb(raw, selected_camera), device) / 255.0
+    intrinsic = _to_tensor(_load_npy_value(_get_sample_value(raw, f"{selected_camera}_intrinsic.npy")), device)
+    extrinsic = _to_tensor(_load_npy_value(_get_sample_value(raw, f"{selected_camera}_extrinsic.npy")), device)
     initial_rgb, intrinsic = resize_rgb_tensor(initial_rgb, intrinsic, args.render_scale)
 
     target_rgb_t = None
@@ -308,7 +367,7 @@ def load_scene_bundle(args) -> SceneBundle:
 
     displacement = positions - positions[:1]
     dynamic_mask = displacement.norm(dim=-1).amax(dim=0) > args.dynamic_threshold
-    key = str(sample.get("__key__", f"{args.domain}:{args.sample_index}"))
+    key = str(raw.get("__key__", f"{args.domain}:{args.sample_index}"))
     return SceneBundle(
         key=key,
         positions=positions,

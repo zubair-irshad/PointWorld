@@ -18,6 +18,31 @@ from extensions.pointworld_gs.renderer import RenderOutput, render_gaussian_surf
 from extensions.pointworld_gs.viz import save_training_grid, write_rgb
 
 
+def _init_wandb(args: argparse.Namespace, output_dir: Path):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError("Install wandb or rerun without --wandb") from exc
+
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        dir=str(output_dir),
+        config=vars(args),
+    )
+
+
+def _wandb_image(image: torch.Tensor, caption: str):
+    import wandb
+
+    array = (image.detach().cpu().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)
+    return wandb.Image(array, caption=caption)
+
+
 def render_frame(
     bundle: SceneBundle,
     geometry: torch.Tensor,
@@ -205,6 +230,7 @@ def train(args: argparse.Namespace) -> None:
     target_images, target_mask, target_source = choose_targets(bundle, geometry, args, model)
     validate_target_shape(bundle, target_images)
     save_metadata(output_dir, bundle, geometry, args, target_source)
+    wandb_run = _init_wandb(args, output_dir)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     frame_order = torch.arange(geometry.shape[0], device=bundle.positions.device)
@@ -291,6 +317,8 @@ def train(args: argparse.Namespace) -> None:
                 "mean_scale_m": float(scales.mean().detach().cpu()),
             }
             writer.writerow(row)
+            if wandb_run is not None and step % args.wandb_log_every == 0:
+                wandb_run.log(row, step=step)
             if step % args.log_every == 0:
                 print(
                     f"step={step:06d} frame={frame_idx:02d} loss={row['loss']:.6f} "
@@ -310,6 +338,17 @@ def train(args: argparse.Namespace) -> None:
                     rendered.alpha,
                     residual,
                 )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "images/initial_rgb": _wandb_image(bundle.initial_rgb, "initial rgb"),
+                            "images/target": _wandb_image(target, f"target frame {frame_idx}"),
+                            "images/prediction": _wandb_image(rendered.image, f"prediction step {step}"),
+                            "images/residual": _wandb_image(residual, f"absolute residual step {step}"),
+                            "images/alpha": _wandb_image(rendered.alpha.expand(-1, -1, 3), f"alpha step {step}"),
+                        },
+                        step=step,
+                    )
 
     with torch.no_grad():
         for frame_idx in range(geometry.shape[0]):
@@ -333,6 +372,8 @@ def train(args: argparse.Namespace) -> None:
         },
         output_dir / "time_dependent_gaussians.pt",
     )
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def parse_bg_color(value: str) -> tuple[float, float, float]:
@@ -360,6 +401,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--viz_every", type=int, default=100)
+    parser.add_argument("--wandb", action="store_true", help="Log training metrics and images to Weights & Biases")
+    parser.add_argument("--wandb_project", default="pointworld-gs")
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default="online")
+    parser.add_argument("--wandb_log_every", type=int, default=1)
 
     parser.add_argument("--geometry", choices=["gt", "static"], default="gt")
     parser.add_argument("--geometry_path", default=None, help="Optional .npy/.npz T,N,3 positions from a PointWorld prediction")

@@ -96,6 +96,29 @@ python extensions/pointworld_gs/overfit_scene.py \
   --output_dir outputs/pointworld_gs/droid_sample0
 ```
 
+Add `--wandb` to stream scalar metrics and periodic visualizations:
+
+```bash
+wandb login
+
+python extensions/pointworld_gs/overfit_scene.py \
+  --domain droid \
+  --data_dir /path/to/droid/wds \
+  --split test \
+  --sample_index 0 \
+  --renderer gsplat \
+  --device cuda \
+  --target_mode auto \
+  --max_frames 8 \
+  --max_scene_points 4000 \
+  --steps 1000 \
+  --enable_emission \
+  --appearance_mode static_dynamic \
+  --wandb \
+  --wandb_project pointworld-gs \
+  --wandb_run_name droid_sample0
+```
+
 For BEHAVIOR:
 
 ```bash
