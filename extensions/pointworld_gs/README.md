@@ -44,6 +44,10 @@ The script exposes:
   current branch does not generate this automatically from URDF yet, but the
   factorizer accepts it so URDF projection or link-sampled masks can be plugged
   in without changing the trainer;
+- `--augment_initial_depth_points`: back-project the selected camera's initial
+  RGB-D frame into additional static Gaussians. This is useful for future-RGB
+  supervision because the tracked trajectory points may not cover all visible
+  pixels;
 - `--appearance_mode full`: every point can change appearance;
 - `--appearance_mode dynamic_only`: only geometrically moving points can change;
 - `--appearance_mode static_dynamic`: learned static/dynamic color biases plus
@@ -144,6 +148,8 @@ python extensions/pointworld_gs/overfit_scene.py \
   --renderer gsplat \
   --device cuda \
   --geometry static_dynamic \
+  --augment_initial_depth_points \
+  --depth_point_stride 1 \
   --target_mode auto \
   --max_frames 8 \
   --max_scene_points 50000 \
@@ -173,6 +179,8 @@ python extensions/pointworld_gs/overfit_scene.py \
   --renderer gsplat \
   --device cuda \
   --geometry rigid_clusters \
+  --augment_initial_depth_points \
+  --depth_point_stride 1 \
   --cluster_spatial_voxel_m 0.06 \
   --cluster_motion_voxel_m 0.01 \
   --min_cluster_points 32 \

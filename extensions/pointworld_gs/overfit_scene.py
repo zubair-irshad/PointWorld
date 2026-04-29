@@ -192,6 +192,8 @@ def save_metadata(
         "target_source": target_source,
         "num_frames": int(geometry.shape[0]),
         "num_points": int(bundle.positions.shape[1]),
+        "num_trajectory_points": int(bundle.num_trajectory_points),
+        "num_depth_aug_points": int(bundle.num_depth_aug_points),
         "num_dynamic_points": int(geometry_state.dynamic_mask.sum().item()),
         "geometry_stats": geometry_state.stats,
         "args": vars(args),
@@ -258,6 +260,8 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"Loaded {bundle.key}: domain={args.domain} camera={bundle.selected_camera} "
         f"T={geometry.shape[0]} N={geometry.shape[1]} "
+        f"trajectory_points={bundle.num_trajectory_points} "
+        f"depth_aug_points={bundle.num_depth_aug_points} "
         f"dynamic_points={int(geometry_state.dynamic_mask.sum())}/{geometry_state.dynamic_mask.numel()} "
         f"rigid_clusters={geometry_state.stats['num_rigid_clusters']} "
         f"rigid_points={geometry_state.stats['num_rigid_points']} "
@@ -458,6 +462,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--max_scene_points", type=int, default=4000)
     parser.add_argument("--max_robot_points", type=int, default=500)
+    parser.add_argument("--augment_initial_depth_points", action="store_true")
+    parser.add_argument("--depth_point_stride", type=int, default=1)
+    parser.add_argument("--max_depth_points", type=int, default=0, help="0 keeps all sampled initial-depth points")
+    parser.add_argument("--depth_min_m", type=float, default=0.05)
+    parser.add_argument("--depth_max_m", type=float, default=5.0)
     parser.add_argument("--grid_size", type=float, default=0.015)
     parser.add_argument("--max_relative_movement", type=float, default=0.25)
     parser.add_argument("--dynamic_threshold", type=float, default=0.01)

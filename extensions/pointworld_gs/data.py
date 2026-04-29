@@ -29,6 +29,8 @@ class SceneBundle:
     dynamic_mask: torch.Tensor
     target_rgb: torch.Tensor | None
     selected_camera: str
+    num_trajectory_points: int
+    num_depth_aug_points: int
 
 
 def list_shards(data_dir: str, split: str) -> list[str]:
@@ -157,6 +159,15 @@ def _load_camera_rgb(sample: dict, camera_prefix: str) -> np.ndarray:
         f"{camera_prefix}_initial_rgb.png",
     )
     return _decode_rgb_value(value)
+
+
+def _load_camera_depth(sample: dict, camera_prefix: str) -> np.ndarray:
+    depth = _load_npy_value(_get_sample_value(sample, f"{camera_prefix}_initial_depth.npy")).astype(np.float32)
+    if depth.ndim != 2:
+        raise ValueError(f"{camera_prefix}_initial_depth must have shape H,W, got {depth.shape}")
+    if float(np.nanmax(depth)) > 100.0:
+        depth = depth / 1000.0
+    return depth
 
 
 def _load_droid_scene(sample: dict, camera_prefix: str) -> tuple[np.ndarray, np.ndarray]:
@@ -304,6 +315,18 @@ def resize_rgb_tensor(rgb: torch.Tensor, intrinsic: torch.Tensor | None, render_
     return resized_t, intr
 
 
+def resize_depth_tensor(depth: torch.Tensor, render_scale: float) -> torch.Tensor:
+    if render_scale == 1.0:
+        return depth
+    if render_scale <= 0.0:
+        raise ValueError("--render_scale must be positive")
+    depth_np = depth.detach().cpu().numpy().astype(np.float32)
+    height, width = depth_np.shape[:2]
+    new_size = (max(1, int(round(width * render_scale))), max(1, int(round(height * render_scale))))
+    resized_np = cv2.resize(depth_np, new_size, interpolation=cv2.INTER_NEAREST)
+    return torch.as_tensor(resized_np, device=depth.device, dtype=torch.float32)
+
+
 def resize_rgb_to_hw(rgb: torch.Tensor, height: int, width: int) -> torch.Tensor:
     """Resize one RGB image or a stack of RGB images to a fixed H,W."""
     if rgb.ndim == 3:
@@ -324,6 +347,63 @@ def resize_rgb_to_hw(rgb: torch.Tensor, height: int, width: int) -> torch.Tensor
 
 def _to_tensor(array: np.ndarray, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return torch.as_tensor(array, device=device, dtype=dtype)
+
+
+def _augment_from_initial_depth(
+    positions: torch.Tensor,
+    colors: torch.Tensor,
+    initial_rgb: torch.Tensor,
+    initial_depth: torch.Tensor,
+    intrinsic: torch.Tensor,
+    extrinsic: torch.Tensor,
+    args,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if not getattr(args, "augment_initial_depth_points", False):
+        return positions, colors, 0
+
+    height, width = initial_depth.shape
+    stride = max(1, int(args.depth_point_stride))
+    ys = torch.arange(0, height, stride, device=positions.device)
+    xs = torch.arange(0, width, stride, device=positions.device)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    z = initial_depth[grid_y, grid_x].reshape(-1)
+    valid = (
+        torch.isfinite(z)
+        & (z >= float(args.depth_min_m))
+        & (z <= float(args.depth_max_m))
+        & (z > 0.0)
+    )
+    if valid.sum() == 0:
+        return positions, colors, 0
+
+    x = grid_x.reshape(-1).to(torch.float32)[valid]
+    y = grid_y.reshape(-1).to(torch.float32)[valid]
+    z = z[valid].to(torch.float32)
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    cam = torch.stack([(x - cx) / fx * z, (y - cy) / fy * z, z], dim=-1)
+    ones = torch.ones((cam.shape[0], 1), device=positions.device, dtype=positions.dtype)
+    cam_h = torch.cat([cam.to(positions.dtype), ones], dim=-1)
+    cam_to_world = torch.linalg.inv(extrinsic.to(positions.dtype))
+    world = (cam_h @ cam_to_world.T)[:, :3]
+    rgb = initial_rgb[grid_y.reshape(-1)[valid], grid_x.reshape(-1)[valid]].to(colors.dtype)
+
+    max_depth_points = int(args.max_depth_points)
+    if max_depth_points > 0 and world.shape[0] > max_depth_points:
+        rng = torch.Generator(device=positions.device)
+        rng.manual_seed(int(args.seed) + 1009)
+        keep = torch.randperm(world.shape[0], device=positions.device, generator=rng)[:max_depth_points]
+        keep, _ = torch.sort(keep)
+        world = world[keep]
+        rgb = rgb[keep]
+
+    static_positions = world[None].expand(positions.shape[0], -1, -1).contiguous()
+    static_colors = rgb[None].expand(colors.shape[0], -1, -1).contiguous()
+    return (
+        torch.cat([positions, static_positions], dim=1),
+        torch.cat([colors, static_colors], dim=1),
+        int(world.shape[0]),
+    )
 
 
 def load_scene_bundle(args) -> SceneBundle:
@@ -349,10 +429,23 @@ def load_scene_bundle(args) -> SceneBundle:
         positions = positions[: args.max_frames]
         colors = colors[: args.max_frames]
 
+    num_trajectory_points = int(positions.shape[1])
     initial_rgb = _to_tensor(_load_camera_rgb(raw, selected_camera), device) / 255.0
+    initial_depth = _to_tensor(_load_camera_depth(raw, selected_camera), device)
     intrinsic = _to_tensor(_load_npy_value(_get_sample_value(raw, f"{selected_camera}_intrinsic.npy")), device)
     extrinsic = _to_tensor(_load_npy_value(_get_sample_value(raw, f"{selected_camera}_extrinsic.npy")), device)
     initial_rgb, intrinsic = resize_rgb_tensor(initial_rgb, intrinsic, args.render_scale)
+    initial_depth = resize_depth_tensor(initial_depth, args.render_scale)
+
+    positions, colors, num_depth_aug_points = _augment_from_initial_depth(
+        positions,
+        colors,
+        initial_rgb,
+        initial_depth,
+        intrinsic,
+        extrinsic,
+        args,
+    )
 
     target_rgb_t = None
     if future_rgb is not None:
@@ -378,4 +471,6 @@ def load_scene_bundle(args) -> SceneBundle:
         dynamic_mask=dynamic_mask,
         target_rgb=target_rgb_t,
         selected_camera=selected_camera,
+        num_trajectory_points=num_trajectory_points,
+        num_depth_aug_points=num_depth_aug_points,
     )
