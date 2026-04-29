@@ -31,8 +31,19 @@ The script exposes:
 
 - `--geometry gt`: move centers with the sample trajectory;
 - `--geometry static`: freeze centers for an appearance-only ablation;
+- `--geometry static_dynamic`: freeze flow-static centers and keep moving
+  centers deformable;
+- `--geometry rigid_clusters`: freeze static centers, fit local SE(3) motion to
+  flow-derived dynamic clusters, and leave small/nonrigid dynamic leftovers
+  deformable;
 - `--geometry_path`: use saved `T,N,3` PointWorld-predicted positions from
   `.npy` or `.npz` instead of the sample trajectory;
+- `--dynamic_mask_path`: optional boolean point mask from external tools,
+  e.g. projected SAM/GroundingDINO/VLM object masks;
+- `--robot_mask_path`: optional boolean point mask for robot-owned points. The
+  current branch does not generate this automatically from URDF yet, but the
+  factorizer accepts it so URDF projection or link-sampled masks can be plugged
+  in without changing the trainer;
 - `--appearance_mode full`: every point can change appearance;
 - `--appearance_mode dynamic_only`: only geometrically moving points can change;
 - `--appearance_mode static_dynamic`: learned static/dynamic color biases plus
@@ -42,6 +53,8 @@ The script exposes:
 
 - `data.py`: loads one WDS sample, selects a camera, preserves trajectories, and
   optionally reads future RGB targets.
+- `geometry.py`: flow-based static/dynamic disentanglement and local rigid
+  cluster fitting.
 - `model.py`: time-dependent Gaussian appearance parameters.
 - `renderer.py`: `gsplat` 3DGS renderer plus pure-PyTorch surfel fallback.
 - `viz.py`: image/grid writing helpers.
@@ -117,6 +130,68 @@ python extensions/pointworld_gs/overfit_scene.py \
   --wandb \
   --wandb_project pointworld-gs \
   --wandb_run_name droid_sample0
+```
+
+For future-RGB overfitting, a better first geometry prior is usually
+`static_dynamic` or `rigid_clusters`:
+
+```bash
+python extensions/pointworld_gs/overfit_scene.py \
+  --domain droid \
+  --data_dir /path/to/droid/wds \
+  --split test \
+  --sample_index 0 \
+  --renderer gsplat \
+  --device cuda \
+  --geometry static_dynamic \
+  --target_mode auto \
+  --max_frames 8 \
+  --max_scene_points 50000 \
+  --render_scale 0.5 \
+  --init_scale_m 0.006 \
+  --steps 3000 \
+  --lr 0.01 \
+  --point_loss_weight 0.0 \
+  --opacity_reg_weight 0.0 \
+  --scale_reg_weight 0.0 \
+  --rotation_reg_weight 0.0 \
+  --enable_emission \
+  --appearance_mode full \
+  --wandb \
+  --wandb_project pointworld-gs \
+  --wandb_run_name droid_sample0_static_dynamic
+```
+
+To test local rigid primitives for robot/object-like motion:
+
+```bash
+python extensions/pointworld_gs/overfit_scene.py \
+  --domain droid \
+  --data_dir /path/to/droid/wds \
+  --split test \
+  --sample_index 0 \
+  --renderer gsplat \
+  --device cuda \
+  --geometry rigid_clusters \
+  --cluster_spatial_voxel_m 0.06 \
+  --cluster_motion_voxel_m 0.01 \
+  --min_cluster_points 32 \
+  --target_mode auto \
+  --max_frames 8 \
+  --max_scene_points 50000 \
+  --render_scale 0.5 \
+  --init_scale_m 0.006 \
+  --steps 3000 \
+  --lr 0.01 \
+  --point_loss_weight 0.0 \
+  --opacity_reg_weight 0.0 \
+  --scale_reg_weight 0.0 \
+  --rotation_reg_weight 0.0 \
+  --enable_emission \
+  --appearance_mode full \
+  --wandb \
+  --wandb_project pointworld-gs \
+  --wandb_run_name droid_sample0_rigid_clusters
 ```
 
 For BEHAVIOR:
@@ -199,6 +274,8 @@ The template gets `camera`, `cam`, `t`, and `frame` variables. For example,
 The output directory contains:
 
 - `metadata.json`: sample/camera/target configuration;
+- `geometry_groups.npz`: dynamic mask, optional robot mask, and rigid-cluster
+  ids used for the run;
 - `metrics.csv`: per-step loss and PSNR estimate;
 - `train_step_*_frame_*.png`: initial/target/prediction/error/alpha grid;
 - `pred_frame_*.png`: final rendered predictions;

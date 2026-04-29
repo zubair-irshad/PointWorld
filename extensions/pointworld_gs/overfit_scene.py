@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from extensions.pointworld_gs.data import SceneBundle, load_scene_bundle
+from extensions.pointworld_gs.geometry import GeometryState, factorize_geometry
 from extensions.pointworld_gs.model import TimeDependentGaussianAppearance
 from extensions.pointworld_gs.renderer import RenderOutput, render_gaussian_surfels, render_gaussians_gsplat
 from extensions.pointworld_gs.viz import save_training_grid, write_rgb
@@ -180,6 +181,7 @@ def save_metadata(
     geometry: torch.Tensor,
     args: argparse.Namespace,
     target_source: str,
+    geometry_state: GeometryState,
 ) -> None:
     metadata = {
         "scene_key": bundle.key,
@@ -190,11 +192,18 @@ def save_metadata(
         "target_source": target_source,
         "num_frames": int(geometry.shape[0]),
         "num_points": int(bundle.positions.shape[1]),
-        "num_dynamic_points": int(bundle.dynamic_mask.sum().item()),
+        "num_dynamic_points": int(geometry_state.dynamic_mask.sum().item()),
+        "geometry_stats": geometry_state.stats,
         "args": vars(args),
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+    np.savez_compressed(
+        output_dir / "geometry_groups.npz",
+        dynamic_mask=geometry_state.dynamic_mask.detach().cpu().numpy(),
+        robot_mask=geometry_state.robot_mask.detach().cpu().numpy(),
+        rigid_cluster_ids=geometry_state.rigid_cluster_ids.detach().cpu().numpy(),
+    )
 
 
 def train(args: argparse.Namespace) -> None:
@@ -211,8 +220,18 @@ def train(args: argparse.Namespace) -> None:
     geometry = load_geometry_override(args.geometry_path, bundle, bundle.positions.device)
     if geometry is None:
         geometry = bundle.positions
-    if args.geometry == "static":
-        geometry = geometry[:1].expand_as(geometry)
+    geometry_state = factorize_geometry(
+        geometry,
+        dynamic_threshold_m=args.dynamic_threshold,
+        mode=args.geometry,
+        dynamic_mask_override_path=args.dynamic_mask_path,
+        robot_mask_path=args.robot_mask_path,
+        cluster_spatial_voxel_m=args.cluster_spatial_voxel_m,
+        cluster_motion_voxel_m=args.cluster_motion_voxel_m,
+        min_cluster_points=args.min_cluster_points,
+    )
+    geometry = geometry_state.positions
+    bundle.dynamic_mask = geometry_state.dynamic_mask
 
     model = TimeDependentGaussianAppearance(
         initial_colors=bundle.colors[0],
@@ -229,7 +248,7 @@ def train(args: argparse.Namespace) -> None:
 
     target_images, target_mask, target_source = choose_targets(bundle, geometry, args, model)
     validate_target_shape(bundle, target_images)
-    save_metadata(output_dir, bundle, geometry, args, target_source)
+    save_metadata(output_dir, bundle, geometry, args, target_source, geometry_state)
     wandb_run = _init_wandb(args, output_dir)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -239,7 +258,9 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"Loaded {bundle.key}: domain={args.domain} camera={bundle.selected_camera} "
         f"T={geometry.shape[0]} N={geometry.shape[1]} "
-        f"dynamic_points={int(bundle.dynamic_mask.sum())}/{bundle.dynamic_mask.numel()} "
+        f"dynamic_points={int(geometry_state.dynamic_mask.sum())}/{geometry_state.dynamic_mask.numel()} "
+        f"rigid_clusters={geometry_state.stats['num_rigid_clusters']} "
+        f"rigid_points={geometry_state.stats['num_rigid_points']} "
         f"target={target_source} render={bundle.initial_rgb.shape[1]}x{bundle.initial_rgb.shape[0]}"
     )
     print(f"Writing outputs to {output_dir}")
@@ -261,6 +282,10 @@ def train(args: argparse.Namespace) -> None:
                 "rotation_reg",
                 "sigma_px",
                 "mean_scale_m",
+                "num_dynamic_points",
+                "num_rigid_clusters",
+                "num_rigid_points",
+                "num_deformable_dynamic_points",
             ],
         )
         writer.writeheader()
@@ -315,6 +340,10 @@ def train(args: argparse.Namespace) -> None:
                 "rotation_reg": float(rotation_reg.detach().cpu()),
                 "sigma_px": float(sigma.detach().cpu()),
                 "mean_scale_m": float(scales.mean().detach().cpu()),
+                "num_dynamic_points": int(geometry_state.stats["num_dynamic_points"]),
+                "num_rigid_clusters": int(geometry_state.stats["num_rigid_clusters"]),
+                "num_rigid_points": int(geometry_state.stats["num_rigid_points"]),
+                "num_deformable_dynamic_points": int(geometry_state.stats["num_deformable_dynamic_points"]),
             }
             writer.writerow(row)
             if wandb_run is not None and step % args.wandb_log_every == 0:
@@ -367,7 +396,10 @@ def train(args: argparse.Namespace) -> None:
             "domain": args.domain,
             "geometry": args.geometry,
             "target_source": target_source,
-            "dynamic_mask": bundle.dynamic_mask.detach().cpu(),
+            "dynamic_mask": geometry_state.dynamic_mask.detach().cpu(),
+            "rigid_cluster_ids": geometry_state.rigid_cluster_ids.detach().cpu(),
+            "robot_mask": geometry_state.robot_mask.detach().cpu(),
+            "geometry_stats": geometry_state.stats,
             "args": vars(args),
         },
         output_dir / "time_dependent_gaussians.pt",
@@ -408,8 +440,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default="online")
     parser.add_argument("--wandb_log_every", type=int, default=1)
 
-    parser.add_argument("--geometry", choices=["gt", "static"], default="gt")
+    parser.add_argument("--geometry", choices=["gt", "static", "static_dynamic", "rigid_clusters"], default="gt")
     parser.add_argument("--geometry_path", default=None, help="Optional .npy/.npz T,N,3 positions from a PointWorld prediction")
+    parser.add_argument("--dynamic_mask_path", default=None, help="Optional .npy/.npz boolean mask overriding flow-based dynamic points")
+    parser.add_argument("--robot_mask_path", default=None, help="Optional .npy/.npz boolean mask for robot-owned points")
+    parser.add_argument("--cluster_spatial_voxel_m", type=float, default=0.06)
+    parser.add_argument("--cluster_motion_voxel_m", type=float, default=0.01)
+    parser.add_argument("--min_cluster_points", type=int, default=32)
     parser.add_argument("--appearance_mode", choices=["full", "dynamic_only", "static_dynamic"], default="full")
     parser.add_argument("--target_mode", choices=["auto", "rendered_points", "future_rgb"], default="auto")
     parser.add_argument("--future_rgb_dir", default=None, help="Optional directory of target RGB frames")
